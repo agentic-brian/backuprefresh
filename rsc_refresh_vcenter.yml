@@ -1,0 +1,521 @@
+---
+# Refresh vCenter inventory (metadata) in Rubrik Security Cloud (RSC).
+#
+# Uses only ansible.builtin modules (uri, set_fact, debug) - no collections needed.
+#
+# Credentials: an RSC service account (Settings > Users and Access > Service Accounts).
+# Keep the secret in Ansible Vault, e.g. group_vars/all/vault.yml:
+#     rsc_url: "https://<tenant>.my.rubrik.com"
+#     rsc_client_id: "client|..."
+#     rsc_client_secret: "..."
+#   ansible-vault encrypt group_vars/all/vault.yml
+#
+# Run:
+#   List only:          ansible-playbook rsc_refresh_vcenter.yml -e list_only=true --ask-vault-pass
+#   Refresh all:        ansible-playbook rsc_refresh_vcenter.yml --ask-vault-pass
+#   Refresh some:       ansible-playbook rsc_refresh_vcenter.yml -e 'vcenter_name_regex=^vcsa01' --ask-vault-pass
+#   Refresh and wait:   ansible-playbook rsc_refresh_vcenter.yml -e wait_for_refresh=true --ask-vault-pass
+#   New VM, back it up: ansible-playbook rsc_refresh_vcenter.yml -e wait_for_refresh=true -e vm_names=SQLREFRESH --ask-vault-pass
+#
+# RECOMMENDED for new VMs: pass vm_names. After a refresh, RSC needs a few minutes to
+# list the VM, attach its vSphere tags and derive its SLA; with vm_names the playbook
+# waits for exactly that (up to 10 min) before taking the backup.
+#
+# After the refresh, VMs tagged LAB_TYPE_VM > Prod that have NO snapshot yet get an
+# on-demand snapshot using their own SLA (for retention). With list_only=true they are
+# only listed. Turn off with -e prod_backup_enabled=false.
+# Use wait_for_refresh=true so brand-new VMs and their tags are in RSC before the check.
+#
+# The playbook then waits (up to 60 min) for each on-demand backup to finish and prints
+# a BACKUP RESULT line. If a backup fails or times out, the play fails (non-zero exit),
+# so a calling playbook / AWX job sees it. Optional: -e notify_webhook_url=<Teams/Slack
+# incoming webhook> to also post the result there. Skip waiting with -e wait_for_backup=false.
+
+- name: Refresh vCenter inventory in Rubrik Security Cloud
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    vcenter_name_regex: ".*"        # which vCenters to refresh (Python regex on name)
+    list_only: false                # true = just show vCenters, refresh nothing
+    wait_for_refresh: false         # true = poll until lastRefreshTime changes
+    wait_retries: 45                # 45 x 20s = 15 minutes
+    wait_delay: 20
+
+    # On-demand backup of tagged VMs that have never been backed up.
+    # RSC tag path: vcenter1.rubrik.lab > LAB_TYPE_VM (category) > Prod (tag)
+    prod_backup_enabled: true
+    prod_tag_category: "LAB_TYPE_VM"
+    prod_tag_name: "Prod"
+
+    # Name(s) of VM(s) you just created. When set, the playbook waits until each one
+    # shows up in RSC with the tag above AND a real SLA (RSC needs a few minutes after
+    # the refresh to add the VM, attach its tags and derive the SLA), then backs up only
+    # those VMs. Accepts a list or a comma-separated string: -e vm_names=SQLREFRESH
+    vm_names: []
+    vm_ready_retries: 30            # 30 x 20s = 10 minutes
+    vm_ready_delay: 20
+    new_vms: "{{ ((vm_names.split(',') if vm_names is string else vm_names) | map('trim') | select | list) }}"
+
+    # Wait for the on-demand backups to finish and report the result.
+    wait_for_backup: true
+    backup_wait_retries: 120        # 120 x 30s = 60 minutes
+    backup_wait_delay: 30
+    # Optional: post the result to a Teams/Slack incoming webhook ({"text": ...}).
+    notify_webhook_url: ""
+
+    rsc_graphql: "{{ rsc_url | regex_replace('/+$', '') }}/api/graphql"
+
+  tasks:
+    - name: Get RSC access token
+      ansible.builtin.uri:
+        url: "{{ rsc_url | regex_replace('/+$', '') }}/api/client_token"
+        method: POST
+        body_format: json
+        body:
+          client_id: "{{ rsc_client_id }}"
+          client_secret: "{{ rsc_client_secret }}"
+        status_code: 200
+      register: rsc_token
+      no_log: true
+
+    - name: Work with RSC, then sign out
+      block:
+        - name: List registered vCenters
+          ansible.builtin.uri:
+            url: "{{ rsc_graphql }}"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ rsc_token.json.access_token }}"
+            body_format: json
+            body:
+              query: |
+                query ListVcenters {
+                  vSphereVCenterConnection(first: 200) {
+                    nodes { id name lastRefreshTime isStandaloneHost }
+                  }
+                }
+          register: vc_list
+          failed_when: vc_list.status != 200 or vc_list.json.errors is defined
+
+        - name: Select vCenters matching '{{ vcenter_name_regex }}'
+          ansible.builtin.set_fact:
+            vcenters: >-
+              {{ vc_list.json.data.vSphereVCenterConnection.nodes
+                 | selectattr('name', 'search', vcenter_name_regex) | list }}
+
+        - name: Show vCenters
+          ansible.builtin.debug:
+            msg: "{{ item.name }} | last refresh: {{ item.lastRefreshTime | default('never', true) }} | id: {{ item.id }}"
+          loop: "{{ vcenters }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Stop if nothing matched
+          ansible.builtin.fail:
+            msg: "No vCenters match '{{ vcenter_name_regex }}'."
+          when: vcenters | length == 0
+
+        - name: Start vCenter refresh
+          ansible.builtin.uri:
+            url: "{{ rsc_graphql }}"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ rsc_token.json.access_token }}"
+            body_format: json
+            body:
+              query: |
+                mutation RefreshVcenter($input: RefreshVsphereVcenterInput!) {
+                  refreshVsphereVcenter(input: $input) {
+                    id status progress startTime error { message }
+                  }
+                }
+              variables:
+                input:
+                  fid: "{{ item.id }}"
+          loop: "{{ vcenters }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: refresh_jobs
+          changed_when: refresh_jobs.json.errors is not defined
+          # The Rubrik cluster runs only ONE on-demand refresh per vCenter at a time.
+          # While one is queued/running, RSC rejects further requests with a generic
+          # GraphQL error ("An unexpected internal error occurred."). Tested in the lab:
+          # 5 parallel requests -> 1 accepted, 4 rejected, 1 refresh ran. So a rejected
+          # request is treated as "refresh already in progress", not a failure; the
+          # waits below (lastRefreshTime / vm_names readiness) confirm the outcome.
+          failed_when: refresh_jobs.status != 200
+          when: not (list_only | bool)
+
+        - name: Report refresh jobs
+          ansible.builtin.debug:
+            msg: >-
+              {% set r = item.json.data.refreshVsphereVcenter | default(none) if item.json.data | default(none) else none %}
+              {%- if r and not (r.error.message | default('', true) if r.error else '') -%}
+              {{ item.item.name }}: refresh job {{ r.id }} status {{ r.status }}
+              {%- else -%}
+              {{ item.item.name }}: refresh request not accepted - a refresh is most likely already
+              queued/running for this vCenter, so this run will use that one.
+              (RSC said: {{ (item.json.errors | default([]) | map(attribute='message') | join('; '))
+                            or (r.error.message if r and r.error else 'no detail') }})
+              {%- endif %}
+          loop: "{{ refresh_jobs.results | default([]) | selectattr('json', 'defined') | list }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+          when: not (list_only | bool)
+
+        - name: Wait for each vCenter's lastRefreshTime to change
+          # Works whether our request started the refresh or joined one already running.
+          ansible.builtin.uri:
+            url: "{{ rsc_graphql }}"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ rsc_token.json.access_token }}"
+            body_format: json
+            body:
+              query: |
+                query ListVcenters {
+                  vSphereVCenterConnection(first: 200) {
+                    nodes { id name lastRefreshTime }
+                  }
+                }
+          loop: "{{ vcenters }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: vc_wait
+          until: >-
+            (vc_wait.json.data.vSphereVCenterConnection.nodes
+             | selectattr('id', 'equalto', item.id) | first).lastRefreshTime
+            not in [none, '', item.lastRefreshTime]
+          retries: "{{ wait_retries }}"
+          delay: "{{ wait_delay }}"
+          when: wait_for_refresh | bool and not (list_only | bool)
+
+        # ---------------------------------------------------------------------
+        # On-demand backup for tagged VMs that have never been backed up.
+        # Tag path in RSC: <vCenter> > LAB_TYPE_VM (tag category) > Prod (tag)
+        # ---------------------------------------------------------------------
+        - name: Wait for new VM(s) to appear in RSC with the tag and an SLA
+          ansible.builtin.uri:
+            url: "{{ rsc_graphql }}"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ rsc_token.json.access_token }}"
+            body_format: json
+            body:
+              query: |
+                query NewVm($name: String!) {
+                  vSphereVmNewConnection(
+                    first: 5
+                    filter: [
+                      { field: NAME_EXACT_MATCH, texts: [$name] }
+                      { field: IS_RELIC, texts: ["false"] }
+                      { field: IS_REPLICATED, texts: ["false"] }
+                    ]
+                  ) {
+                    nodes { id name vsphereTagPath { name } effectiveSlaDomain { id name } }
+                  }
+                }
+              variables:
+                name: "{{ item }}"
+          loop: "{{ new_vms }}"
+          register: vm_ready
+          until: >-
+            vm_ready.json is defined and vm_ready.json.data is defined and vm_ready.json.data
+            and (vm_ready.json.data.vSphereVmNewConnection.nodes | length) > 0
+            and prod_tag_category in (vm_ready.json.data.vSphereVmNewConnection.nodes[0].vsphereTagPath | default([]) | map(attribute='name') | list)
+            and prod_tag_name in (vm_ready.json.data.vSphereVmNewConnection.nodes[0].vsphereTagPath | default([]) | map(attribute='name') | list)
+            and (vm_ready.json.data.vSphereVmNewConnection.nodes[0].effectiveSlaDomain.id | default('UNPROTECTED')) not in ['UNPROTECTED', 'DO_NOT_PROTECT']
+          retries: "{{ vm_ready_retries }}"
+          delay: "{{ vm_ready_delay }}"
+          ignore_errors: true          # reported below
+          when:
+            - prod_backup_enabled | bool
+            - new_vms | length > 0
+            - not (list_only | bool)
+
+        - name: Record VM(s) that never became ready
+          ansible.builtin.set_fact:
+            backup_results: "{{ backup_results | default([]) + [entry] }}"
+          loop: "{{ vm_ready.results | default([]) | selectattr('failed', 'defined') | selectattr('failed') | list }}"
+          loop_control:
+            label: "{{ item.item }}"
+          vars:
+            nodes_l: "{{ item.json.data.vSphereVmNewConnection.nodes | default([], true) }}"
+            tag_names: "{{ (nodes_l[0].vsphereTagPath | default([], true) | map(attribute='name') | list) if (nodes_l | length) > 0 else [] }}"
+            sla_name: "{{ (nodes_l[0].effectiveSlaDomain.name | default('none')) if (nodes_l | length) > 0 else 'none' }}"
+            reason: >-
+              {{ 'NOT FOUND in RSC' if (nodes_l | length) == 0
+                 else ('NOT TAGGED ' ~ prod_tag_category ~ ' > ' ~ prod_tag_name
+                       if (prod_tag_category not in tag_names or prod_tag_name not in tag_names)
+                 else 'HAS NO SLA (' ~ sla_name ~ ')') }}
+            entry:
+              vm: "{{ item.item }}"
+              ok: false
+              finished: ""
+              error: ""
+              status: "{{ reason }} after waiting {{ vm_ready_retries | int * vm_ready_delay | int }}s - not backed up"
+          when:
+            - prod_backup_enabled | bool
+            - new_vms | length > 0
+            - not (list_only | bool)
+
+        - name: List VMs with tags, SLA and newest snapshot
+          ansible.builtin.uri:
+            url: "{{ rsc_graphql }}"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ rsc_token.json.access_token }}"
+            body_format: json
+            body:
+              query: |
+                query TaggedVms {
+                  vSphereVmNewConnection(
+                    first: 1000
+                    filter: [
+                      { field: IS_RELIC, texts: ["false"] }
+                      { field: IS_REPLICATED, texts: ["false"] }
+                    ]
+                  ) {
+                    nodes {
+                      id
+                      name
+                      vsphereTagPath { fid name objectType }
+                      effectiveSlaDomain { id name }
+                      newestSnapshot { id date }
+                      cluster { id name }
+                    }
+                    pageInfo { hasNextPage }
+                  }
+                }
+          register: vm_list
+          failed_when: vm_list.status != 200 or vm_list.json.errors is defined
+          when: prod_backup_enabled | bool
+
+        - name: Warn if there are more than 1000 VMs (only the first 1000 are checked)
+          ansible.builtin.debug:
+            msg: "WARNING: more than 1000 VMs - only the first 1000 were checked for the {{ prod_tag_name }} tag."
+          when:
+            - prod_backup_enabled | bool
+            - vm_list.json.data.vSphereVmNewConnection.pageInfo.hasNextPage
+
+        - name: Start with an empty tagged-VM list
+          ansible.builtin.set_fact:
+            tagged_vms: []
+          when: prod_backup_enabled | bool
+
+        - name: Find '{{ prod_tag_category }} > {{ prod_tag_name }}' VMs
+          ansible.builtin.set_fact:
+            tagged_vms: "{{ tagged_vms + [item] }}"
+          loop: "{{ vm_list.json.data.vSphereVmNewConnection.nodes }}"
+          loop_control:
+            label: "{{ item.name }}"
+          vars:
+            path_names: "{{ item.vsphereTagPath | default([]) | map(attribute='name') | list }}"
+          when:
+            - prod_backup_enabled | bool
+            - prod_tag_category in path_names
+            - prod_tag_name in path_names
+            - new_vms | length == 0 or item.name in new_vms
+
+        - name: Split into never-backed-up vs already-backed-up
+          ansible.builtin.set_fact:
+            needs_backup: "{{ tagged_vms | selectattr('newestSnapshot', 'none') | list }}"
+            has_backup: "{{ tagged_vms | rejectattr('newestSnapshot', 'none') | list }}"
+            no_real_sla: >-
+              {{ tagged_vms | selectattr('newestSnapshot', 'none')
+                 | selectattr('effectiveSlaDomain.id', 'in', ['UNPROTECTED', 'DO_NOT_PROTECT']) | list }}
+          when: prod_backup_enabled | bool
+
+        - name: Named VM(s) that already have a backup (SLA got there first) count as done
+          ansible.builtin.set_fact:
+            backup_results: "{{ backup_results | default([]) + [entry] }}"
+          loop: "{{ has_backup | default([]) }}"
+          loop_control:
+            label: "{{ item.name }}"
+          vars:
+            entry:
+              vm: "{{ item.name }}"
+              ok: true
+              status: "ALREADY BACKED UP"
+              finished: "{{ item.newestSnapshot.date }}"
+              error: ""
+          when:
+            - prod_backup_enabled | bool
+            - new_vms | length > 0
+            - not (list_only | bool)
+
+        - name: Show tagged VMs
+          ansible.builtin.debug:
+            msg: >-
+              {{ item.name }} | SLA: {{ item.effectiveSlaDomain.name | default('none') }}
+              | newest snapshot: {{ item.newestSnapshot.date if item.newestSnapshot else 'NONE - needs backup' }}
+              | tag path: {{ item.vsphereTagPath | map(attribute='name') | reverse | join(' > ') }}
+          loop: "{{ tagged_vms | default([]) }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: prod_backup_enabled | bool
+
+        - name: Skip VMs whose SLA is not a real SLA Domain (would be kept forever)
+          ansible.builtin.debug:
+            msg: "SKIPPING {{ item.name }}: effective SLA is '{{ item.effectiveSlaDomain.name | default('none') }}'."
+          loop: "{{ needs_backup | default([]) }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when:
+            - prod_backup_enabled | bool
+            - (item.effectiveSlaDomain.id | default('UNPROTECTED')) in ['UNPROTECTED', 'DO_NOT_PROTECT']
+
+        - name: Take on-demand snapshot (uses the VM's own SLA for retention)
+          ansible.builtin.uri:
+            url: "{{ rsc_graphql }}"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ rsc_token.json.access_token }}"
+            body_format: json
+            body:
+              query: |
+                mutation OnDemand($input: VsphereOnDemandSnapshotInput!) {
+                  vsphereOnDemandSnapshot(input: $input) {
+                    id status startTime error { message }
+                  }
+                }
+              variables:
+                input:
+                  id: "{{ item.id }}"
+                  config:
+                    slaId: "{{ item.effectiveSlaDomain.id }}"
+          loop: "{{ needs_backup | default([]) }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: od_jobs
+          changed_when: true
+          failed_when: >-
+            od_jobs.status != 200
+            or od_jobs.json.errors is defined
+            or (od_jobs.json.data.vsphereOnDemandSnapshot.error.message | default('', true)) | length > 0
+          when:
+            - prod_backup_enabled | bool
+            - not (list_only | bool)
+            - (item.effectiveSlaDomain.id | default('UNPROTECTED')) not in ['UNPROTECTED', 'DO_NOT_PROTECT']
+
+        - name: Report on-demand snapshot jobs
+          ansible.builtin.debug:
+            msg: >-
+              {{ item.item.name }}: on-demand snapshot job {{ item.json.data.vsphereOnDemandSnapshot.id }}
+              status {{ item.json.data.vsphereOnDemandSnapshot.status }}
+          loop: "{{ od_jobs.results | default([]) | selectattr('json', 'defined') | list }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+          when: prod_backup_enabled | bool
+
+        - name: Wait for on-demand backups to finish
+          ansible.builtin.uri:
+            url: "{{ rsc_graphql }}"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ rsc_token.json.access_token }}"
+            body_format: json
+            body:
+              query: |
+                query JobStatus($clusterUuid: UUID!, $id: String!) {
+                  vSphereVMAsyncRequestStatus(clusterUuid: $clusterUuid, id: $id) {
+                    id status progress startTime endTime error { message }
+                  }
+                }
+              variables:
+                clusterUuid: "{{ item.item.cluster.id }}"
+                id: "{{ item.json.data.vsphereOnDemandSnapshot.id }}"
+          loop: "{{ od_jobs.results | default([]) | selectattr('json', 'defined') | list }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+          register: bk_wait
+          until: >-
+            bk_wait.json is defined and bk_wait.json.data is defined and bk_wait.json.data
+            and bk_wait.json.data.vSphereVMAsyncRequestStatus.status in ['SUCCEEDED', 'FAILED', 'CANCELED']
+          retries: "{{ backup_wait_retries }}"
+          delay: "{{ backup_wait_delay }}"
+          ignore_errors: true          # report timeouts/failures below instead of stopping here
+          when:
+            - prod_backup_enabled | bool
+            - wait_for_backup | bool
+            - not (list_only | bool)
+
+        - name: Build backup results
+          ansible.builtin.set_fact:
+            backup_results: "{{ backup_results | default([]) + [entry] }}"
+          loop: "{{ bk_wait.results | default([]) | selectattr('item', 'defined') | list }}"
+          loop_control:
+            label: "{{ item.item.item.name }}"
+          vars:
+            st: "{{ item.json.data.vSphereVMAsyncRequestStatus | default({}) if (item.json.data | default(none)) else {} }}"
+            entry:
+              vm: "{{ item.item.item.name }}"
+              status: >-
+                {{ st.status if (st.status | default('')) in ['SUCCEEDED', 'FAILED', 'CANCELED']
+                   else 'NOT FINISHED (still ' ~ (st.status | default('unknown')) ~ ' after waiting '
+                        ~ (backup_wait_retries | int * backup_wait_delay | int) ~ 's - check RSC)' }}
+              ok: "{{ (st.status | default('')) == 'SUCCEEDED' }}"
+              finished: "{{ st.endTime | default('') }}"
+              error: "{{ (st.error.message | default('', true)) if st.error is defined and st.error else '' }}"
+          when:
+            - prod_backup_enabled | bool
+            - wait_for_backup | bool
+            - not (list_only | bool)
+            - item.skipped is not defined
+
+        - name: Compose backup notice
+          ansible.builtin.set_fact:
+            backup_notice: >-
+              {%- set lines = [] -%}
+              {%- for r in backup_results | default([]) -%}
+              {%- set _ = lines.append(
+                    (r.vm ~ ': already protected - SLA snapshot taken at ' ~ r.finished) if (r.ok and r.status == 'ALREADY BACKED UP')
+                    else (r.vm ~ ': backup COMPLETED at ' ~ r.finished) if r.ok
+                    else (r.vm ~ ': ' ~ r.status ~ ((' - ' ~ r.error) if r.error else ''))) -%}
+              {%- endfor -%}
+              {{ 'Rubrik on-demand backup results: ' ~ (lines | join('; ')) }}
+          when: backup_results | default([]) | length > 0
+
+        - name: BACKUP RESULT
+          ansible.builtin.debug:
+            msg: "{{ backup_notice }}"
+          when: backup_notice is defined
+
+        - name: Send backup notice to webhook (Teams/Slack)
+          ansible.builtin.uri:
+            url: "{{ notify_webhook_url }}"
+            method: POST
+            body_format: json
+            body:
+              text: "{{ backup_notice }}"
+            status_code: [200, 201, 202, 204]
+          when:
+            - backup_notice is defined
+            - notify_webhook_url | length > 0
+
+        - name: Summary
+          ansible.builtin.debug:
+            msg:
+              - "{{ prod_tag_category }} > {{ prod_tag_name }} VMs found: {{ tagged_vms | default([]) | length }}"
+              - "Already backed up: {{ has_backup | default([]) | map(attribute='name') | list }}"
+              - "Skipped, no real SLA: {{ no_real_sla | default([]) | map(attribute='name') | list }}"
+              - "{{ 'Would back up (list_only)' if list_only | bool else 'On-demand backup started' }}: {{ needs_backup | default([]) | difference(no_real_sla | default([])) | map(attribute='name') | list }}"
+          when: prod_backup_enabled | bool
+
+        - name: Fail the play if any backup did not succeed
+          ansible.builtin.fail:
+            msg: "{{ backup_notice }}"
+          when: backup_results | default([]) | rejectattr('ok') | list | length > 0
+
+      always:
+        - name: Sign out the service-account session
+          ansible.builtin.uri:
+            url: "{{ rsc_url | regex_replace('/+$', '') }}/api/session"
+            method: DELETE
+            headers:
+              Authorization: "Bearer {{ rsc_token.json.access_token }}"
+            status_code: [200, 204]
+          failed_when: false
+          no_log: true

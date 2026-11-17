@@ -1,0 +1,6 @@
+# Example only. Fill in your RSC service account details, save as vault.yml
+# in this folder, then encrypt it:
+#   ansible-vault encrypt group_vars/all/vault.yml
+rsc_url: "https://YOUR-ACCOUNT.my.rubrik.com"
+rsc_client_id: "client|REPLACE_ME"
+rsc_client_secret: "REPLACE_ME"

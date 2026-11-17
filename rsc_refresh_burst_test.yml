@@ -1,0 +1,143 @@
+---
+# LAB TEST: fire several vCenter refresh requests at RSC at the same time and record
+# what comes back, to see whether overlapping requests are merged or each runs a
+# separate refresh. Afterwards, count "Finished refreshing vCenter" events in
+# RSC > Event Logs for the test window.
+#
+#   ansible-playbook rsc_refresh_burst_test.yml --ask-vault-pass
+#   ansible-playbook rsc_refresh_burst_test.yml -e burst_count=10 --ask-vault-pass
+#
+# Uses the same vault variables as rsc_refresh_vcenter.yml (rsc_url, rsc_client_id, rsc_client_secret).
+
+- name: vCenter refresh burst test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    burst_count: 5
+    extra_watch_seconds: 60
+    vcenter_name_regex: ".*"
+    rsc_base: "{{ rsc_url | regex_replace('/+$', '') }}"
+    rsc_graphql: "{{ rsc_base }}/api/graphql"
+    list_vcenters_query: |
+      query { vSphereVCenterConnection(first: 50) { nodes { id name lastRefreshTime } } }
+
+  tasks:
+    - name: Get RSC access token
+      ansible.builtin.uri:
+        url: "{{ rsc_base }}/api/client_token"
+        method: POST
+        body_format: json
+        body:
+          client_id: "{{ rsc_client_id }}"
+          client_secret: "{{ rsc_client_secret }}"
+      register: rsc_token
+      no_log: true
+
+    - name: Run the test, then sign out
+      block:
+        - name: Find the vCenter
+          ansible.builtin.uri:
+            url: "{{ rsc_graphql }}"
+            method: POST
+            headers: { Authorization: "Bearer {{ rsc_token.json.access_token }}" }
+            body_format: json
+            body: { query: "{{ list_vcenters_query }}" }
+          register: vc_before
+
+        - name: Pick vCenter and note its last refresh time
+          ansible.builtin.set_fact:
+            vc: "{{ vc_before.json.data.vSphereVCenterConnection.nodes | selectattr('name', 'search', vcenter_name_regex) | first }}"
+            test_start: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+        - name: Test target
+          ansible.builtin.debug:
+            msg: "vCenter {{ vc.name }} | last refresh before test: {{ vc.lastRefreshTime }} | test started {{ test_start }} UTC | firing {{ burst_count }} refresh requests in parallel"
+
+        - name: Fire {{ burst_count }} refresh requests in parallel
+          ansible.builtin.uri:
+            url: "{{ rsc_graphql }}"
+            method: POST
+            headers: { Authorization: "Bearer {{ rsc_token.json.access_token }}" }
+            body_format: json
+            body:
+              query: |
+                mutation R($input: RefreshVsphereVcenterInput!) {
+                  refreshVsphereVcenter(input: $input) { id status startTime endTime error { message } }
+                }
+              variables: { input: { fid: "{{ vc.id }}" } }
+          loop: "{{ range(1, burst_count | int + 1) | list }}"
+          loop_control:
+            label: "request {{ item }}"
+          async: 120
+          poll: 0
+          register: burst
+
+        - name: Collect the responses
+          ansible.builtin.async_status:
+            jid: "{{ item.ansible_job_id }}"
+          loop: "{{ burst.results }}"
+          loop_control:
+            label: "request {{ item.item }}"
+          register: burst_done
+          until: burst_done.finished
+          retries: 60
+          delay: 1
+
+        - name: What RSC returned for each request
+          ansible.builtin.debug:
+            msg: >-
+              request {{ item.item.item }}:
+              {% if item.json.errors is defined %}GraphQL error: {{ item.json.errors | map(attribute='message') | join('; ') }}
+              {% else %}{% set r = item.json.data.refreshVsphereVcenter %}job {{ r.id }} | status {{ r.status }} | started {{ r.startTime | default('-') }}{{ ' | error: ' ~ r.error.message if r.error else '' }}{% endif %}
+          loop: "{{ burst_done.results }}"
+          loop_control:
+            label: "request {{ item.item.item }}"
+
+        - name: Wait for the vCenter's last refresh time to move (up to 5 min)
+          ansible.builtin.uri:
+            url: "{{ rsc_graphql }}"
+            method: POST
+            headers: { Authorization: "Bearer {{ rsc_token.json.access_token }}" }
+            body_format: json
+            body: { query: "{{ list_vcenters_query }}" }
+          register: vc_after
+          until: >-
+            (vc_after.json.data.vSphereVCenterConnection.nodes | selectattr('id', 'equalto', vc.id) | first).lastRefreshTime
+            not in [none, '', vc.lastRefreshTime]
+          retries: 30
+          delay: 10
+          ignore_errors: true
+
+        - name: Keep watching another {{ extra_watch_seconds }}s in case more refreshes run back-to-back
+          ansible.builtin.pause:
+            seconds: "{{ extra_watch_seconds }}"
+
+        - name: Final last refresh time
+          ansible.builtin.uri:
+            url: "{{ rsc_graphql }}"
+            method: POST
+            headers: { Authorization: "Bearer {{ rsc_token.json.access_token }}" }
+            body_format: json
+            body: { query: "{{ list_vcenters_query }}" }
+          register: vc_final
+
+        - name: RESULT
+          ansible.builtin.debug:
+            msg:
+              - "Requests sent: {{ burst_count }} (in parallel) at {{ test_start }} UTC"
+              - "Distinct job IDs returned: {{ burst_done.results | map(attribute='json') | map(attribute='data', default={}) | select | map(attribute='refreshVsphereVcenter') | map(attribute='id') | unique | list }}"
+              - "Statuses returned: {{ burst_done.results | map(attribute='json') | map(attribute='data', default={}) | select | map(attribute='refreshVsphereVcenter') | map(attribute='status') | list }}"
+              - "Last refresh before: {{ vc.lastRefreshTime }}  after: {{ (vc_final.json.data.vSphereVCenterConnection.nodes | selectattr('id', 'equalto', vc.id) | first).lastRefreshTime }}"
+              - "Next: count 'Finished refreshing vCenter' events in RSC Event Logs since {{ test_start }} UTC."
+
+      always:
+        - name: Sign out
+          ansible.builtin.uri:
+            url: "{{ rsc_base }}/api/session"
+            method: DELETE
+            headers: { Authorization: "Bearer {{ rsc_token.json.access_token }}" }
+            status_code: [200, 204]
+          failed_when: false
+          no_log: true
